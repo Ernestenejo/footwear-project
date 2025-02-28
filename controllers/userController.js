@@ -1,171 +1,256 @@
-const User = require('../models/userModel');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-require('dotenv').config();
+const userModel = require('../models/userModel')
+const cloudinary = require('../helper/cloudinary')
+const fs = require('fs');
+const sendMail = require('../helper/email')
+const jwt = require('jsonwebtoken')
+const signUp = require('../helper/signup')
+const bcrypt = require('bcrypt')
+const LOCK = process.env.LOCK
 
-exports.register = async (req, res) => {
+exports.createUser = async (req, res)=>{
     try {
-        const { fullName, email, password, address, phoneNumber, role } = req.body;
+        const {fullName,address, email, password, role, phoneNumber} =req.body
 
-        const existingUser = await User.findOne({ email });
-        if (existingUser) return res.status(400).json({ message: 'Email already exists' });
+        const uploadImage = await cloudinary.uploader.upload(req.file.path, (err,data)=>{
+            if(err){
+                res.status(400).json({message:err.message})
+            }else{
+return data
+            }
+        })
+        const salt =await bcrypt.genSalt(10);
+        const hash =await bcrypt.hashSync(password, salt)
+          
+const userData = {
+    fullName: fullName,
+    address: address,
+    email: email,
+    password:hash,
+    phoneNumber,
+    role,
+    userImageUrl: uploadImage.secure_url,
+    userImageId: uploadImage.public_id
+            }
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = new User({
-            fullName,
-            email,
-            password: hashedPassword,
-            address,
-            phoneNumber,
-            role: role
-        });
-
-        await newUser.save();
-        res.status(201).json({
-             message: 'User registered successfully', 
-             data: newUser
-             });
-
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+fs.unlink(req.file.path, (err)=>{
+    if(err){
+        console.log(err.message)
+    }else{
+        console.log("file uploaded successfully")
     }
-};
+})
+          const newUser = await userModel.create(userData);
+          const token = await jwt.sign({id:newUser._id}, LOCK, {expiresIn:'10mins'})
+            const link = `${req.protocol}://${req.get('host')}/mail/${newUser._id}/${token}`
+        
+
+        const subject = "Welcome to this platform" + "  "  + fullName
+          sendMail({subject:subject,email:newUser.email, html:signUp(link,newUser.fullName)})
+    
+           return res.status(201).json({
+                message: `User created successfully`,
+                data:newUser
+            })
+            
+        
+    } catch (error) {
+
+    return res.status(500).json({
+        message: error.message
+     })   
+    }
+}
+
+exports.verifyEmail = async (req,res)=>{
+    try {
+        const {id} = req.params
+        const checkUser = await userModel.findById(id)
+        if(!checkUser){
+            return res.status(404).json({message: "No User Found"}
+            )
+        }
+        if(checkUser.isVerified === true){
+            return res.status(400).json({
+                message:"Email has already been verified"
+            })
+        }
+      try{  
+       await jwt.verify(req.params.token, LOCK)
+       
+       }catch(error){
+            return res.status(404).json({message: "Email Link Has Expired"
+
+            })   
+            
+    }
+        await userModel.findByIdAndUpdate(id, {isVerified:true})
+       return res.status(200).json({
+            message:"Email Verified Succefully"
+        })
+    } catch (error) {
+        return res.status(500).json({message:error.message})
+    }
+}
 
 
-exports.login = async (req, res) => {
+exports.userLogin = async(req, res) => {
     try {
         const { email, password } = req.body;
-
-        const user = await User.findOne({ email });
-        if (!user) return res.status(404).json({
-             message: "User not found" 
+        const checkEmail = await userModel.findOne({ email });
+        if (!checkEmail) {
+            return res.status(404).json({
+                message: "Email not found"
             });
+        }
 
-      
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) return res.status(401).json({
-             message: "Invalid credentials" 
+        const checkPassword = await bcrypt.compareSync(password, checkEmail.password);
+
+        if (!checkPassword) {
+            return res.status(404).json({
+                message: "Invalid Password"
             });
+        }
 
-        
-        const token = jwt.sign(
-            { id: user._id, role: user.role },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
-        );
+        if (checkEmail.isVerified === false) {
+            return res.status(400).json({
+                message: "Email not verified"
+            });
+        }
+
+        // Prepare newData object to include details of the user
+        const newData = {
+            fullName: checkEmail.fullName,
+            email: checkEmail.email,
+            id: checkEmail._id
+        };
+
+        const token = await jwt.sign({ id: checkEmail._id }, LOCK, { expiresIn: "24hrs" });
 
         res.status(200).json({
-             message: "Login successful", token
-             });
-    } catch (error) {
-        res.status(500).json({ 
-            message: error.message
-         });
-    }
-};
-
-
-exports.forgotPassword = async (req, res) => {
-    try {
-        const { email, newPassword } = req.body;
-
-        const user = await User.findOne({ email });
-        if (!user) return res.status(404).json({ 
-            message: "User not found" 
+            message: "Login successful",
+            data: newData,  // send the user details in the response
+            token
         });
-
-      
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        user.password = hashedPassword;
-        await user.save();
-
-        res.status(200).json({
-             message: "Password reset successful" 
-            });
-
-    } catch (error) {
-        res.status(500).json({ 
-            message: error.message 
-        });
-    }
-};
-
-exports.changePassword = async (req, res) => {
-    try {
-        const { oldPassword, newPassword } = req.body;
-        const user = await User.findById(req.user.id);
-
-        if (!user) return res.status(404).json({ 
-            message: "User not found" 
-        });
-
-       
-        const isMatch = await bcrypt.compare(oldPassword, user.password);
-        if (!isMatch) return res.status(401).json({
-             message: "Old password is incorrect" 
-            });
-
-      
-        user.password = await bcrypt.hash(newPassword, 10);
-        await user.save();
-
-        res.status(200).json({ 
-            message: "Password changed successfully"
-         });
-
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
-};
-
-
-exports.getProfile = async (req, res) => {
-    try {
-        const user = await User.findById(req.user.id).select('-password');
-        if (!user) return res.status(404).json({
-             message: "User not found"
-             });
-
-        res.status(200).json({ 
-            message: "Profile retrieved successfully",
-             data: user 
-            });
 
     } catch (error) {
         res.status(500).json({
-             message: error.message
-             });
-    }
-};
-
-// admin can gwet all users
-exports.getAllUsers = async (req, res) => {
-    try {
-        const users = await User.find().select('-password');
-        res.status(200).json({ 
-            message: "Users retrieved successfully",
-             data: users });
-
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
-};
-
-// Admin fit Delete User
-exports.deleteUser = async (req, res) => {
-    try {
-        const user = await User.findByIdAndDelete(req.params.id);
-        if (!user) return res.status(404).json({ 
-            message: "User not found" 
+            message: "Unable to Login: " + error.message
         });
-
-        res.status(200).json({
-             message: "User deleted successfully"
-             });
-
-    } catch (error) {
-        res.status(500).json({ 
-            message: error.message
-         });
     }
 };
+
+exports.changeDP = async (req, res) =>{
+    try{
+        const {id} = req.params;
+        const findUser = await userModel.findById(id);
+console.log("uploaded")
+        if(!findUser){
+            return res.status(404).json({
+                message: "User Not Found"
+            })
+        }
+
+        //This gets the image file from Cloudinary via the file path
+const cloudImage = await cloudinary.uploader.upload(req.file.path, (err)=>{
+    if(err){
+        return res.status(404).json({
+            message: err.message
+        })
+    }
+})
+        const newPhoto = {
+            userImageUrl: cloudImage.secure_url, 
+            userImageId: cloudImage.public_id
+        }
+
+        const delImage = await cloudinary.uploader.destroy(findUser.userImageId, (err)=>{
+            if(err){
+                return res.status(404).json({
+                    message: err.message
+                })
+            }
+        })
+
+        fs.unlink(req.file.path, (err)=>{
+            if(err){
+                console.log(err.message)
+            }else{
+                console.log("Previous File Removed Successfully")
+            }
+        })
+
+        const updateImage = await schoolModel.findByIdAndUpdate(id, newPhoto, {new: true})
+        return res.status(200).json({
+            message: "Image Successfully Updated"
+        })
+    }catch(err){
+        res.status(500).json({
+            message: "Internal Server Error" + err.message,
+
+        })
+    }
+}
+
+exports.getallUser = async (req, res) =>{
+    try {
+        const findallUser = await userModel.find()
+        res.status(200).json({
+            message: `All Users in Database`,
+            data:findallUser
+        })
+    } catch (error) {
+        res.status(500).json({
+            message:error.message 
+        })
+      
+    }
+}
+
+exports.getOneUser = async (req, res)=>{
+    try {
+        const {id} = req.params
+        const findUser = await userModel.find(id)
+        if(!findUser) {
+            res.status(404).json({
+                message:`User not found`
+            })
+        }else{
+            res.status(200).json({
+                message:`User found`,
+                data: findUser
+            })
+        }
+    } catch (error) {
+        res.status(500).json({
+            message:error.message 
+        }) 
+    }
+}
+
+
+
+
+
+exports.getOneUser = async (req, res) =>{
+    try {
+        const { id } = req.params
+        const findUser = await schoolModel.findById(id)
+        if (!findUser) {
+            res.status(404).json({
+             message: `User not found`   
+            })
+        }  
+        else {
+            res.status(200).json({
+            message: `User found`,
+            data: findUser
+            })
+        }
+        
+    } catch (error) {
+        res.status(500).json({
+            message: error.message 
+        })
+      
+    }
+}
